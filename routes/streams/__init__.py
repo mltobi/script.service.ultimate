@@ -444,6 +444,74 @@ def make_helpers(manager, service):
 
         return None
 
+    def _serve_adjusted_catchup(provider: str, content_id: str, start_time: int,
+                                 end_time: int, epg_id, country, drm_variant: str):
+        """
+        For providers whose catchup MPD needs a programme-start shift (Magenta2),
+        fetch the manifest, apply the adjuster, inject an absolute BaseURL and
+        serve the body — instead of redirecting to the raw CDN live+DVR manifest
+        (a 303 bypasses the adjuster, so playback would start at the live edge).
+        Returns None when no adjuster applies, signalling the caller to redirect.
+        """
+        if provider != "magenta2":
+            return None
+
+        manifest_url = manager.get_catchup_manifest(
+            provider_name=provider, channel_id=content_id,
+            start_time=start_time, end_time=end_time,
+            epg_id=epg_id, country=country, drm_variant=drm_variant,
+        )
+        if not manifest_url:
+            response.status = 404
+            return {"error": f'Catchup manifest not available for channel "{content_id}"'}
+
+        try:
+            manifest_text, _, _, _, effective_url = service.fetch_manifest_for_rewriter(
+                provider, content_id, manifest_url
+            )
+            manifest_text = service._apply_magenta2_catchup_adjustment(
+                provider, manifest_text, start_time, end_time
+            )
+            # Inject an absolute MPD-level BaseURL (the CDN manifest directory) so the
+            # manifest's own relative BaseURL/segment paths resolve to the CDN, not to
+            # this backend. Unconditional on purpose: the CDN manifest already carries a
+            # relative Period-level <BaseURL>, which _inject_base_url would treat as
+            # "already has a BaseURL" and skip, leaving segments pointed at us (404).
+            cdn_base = urljoin(effective_url, ".")
+            manifest_text = re.sub(
+                r"(<MPD\b[^>]*>)",
+                rf"\1\n  <BaseURL>{cdn_base}</BaseURL>",
+                manifest_text,
+                count=1,
+            )
+            logger.debug(
+                f"CATCHUP ADJUSTED-SERVE: {provider}/{content_id} "
+                f"start={start_time} end={end_time} via {effective_url}"
+            )
+            response.content_type = "application/dash+xml; charset=utf-8"
+            return manifest_text
+        except Exception as e:
+            logger.error(f"Catchup adjusted-serve failed for {provider}/{content_id}: {e}")
+            response.status = 502
+            return {"error": f"Failed to fetch catchup manifest: {str(e)}"}
+
+    def _catchup_redirect(provider: str, content_id: str, start_time: int,
+                          end_time: int, epg_id, country, drm_variant: str):
+        """Resolve the catchup manifest URL and 302-redirect to it (or 404)."""
+        manifest_url = manager.get_catchup_manifest(
+            provider_name=provider, channel_id=content_id,
+            start_time=start_time, end_time=end_time,
+            epg_id=epg_id, country=country, drm_variant=drm_variant,
+        )
+        if not manifest_url:
+            response.status = 404
+            return {"error": f'Catchup manifest not available for channel "{content_id}"'}
+        logger.debug(
+            f"CATCHUP REDIRECT: {provider}/{content_id} "
+            f"start={start_time} end={end_time} -> {manifest_url}"
+        )
+        return redirect(manifest_url)
+
     def _redirect_or_fetch(content_type: str, provider: str, content_id: str,
                             country, drm_variant: str):
         """
@@ -591,6 +659,10 @@ def make_helpers(manager, service):
         # _resolve_decrypted_stream (for decrypt); now the single source of truth
         # for every mode, so channels.py no longer needs its own copy. ---
         if is_catchup and content_type == CONTENT_TYPE_CHANNEL:
+            logger.debug(
+                f"CATCHUP REQUEST: {provider}/{content_id} "
+                f"start={start_time} end={end_time} epg_id={epg_id} country={country}"
+            )
             window_error = _validate_catchup_window(provider, content_id, start_time)
             if window_error:
                 response.status = 400
@@ -631,22 +703,9 @@ def make_helpers(manager, service):
         # ==================================================================
         if is_catchup:
             if no_proxy:
-                manifest_url = manager.get_catchup_manifest(
-                    provider_name=provider,
-                    channel_id=content_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    epg_id=epg_id,
-                    country=country,
-                    drm_variant=drm_variant,
+                return _catchup_redirect(
+                    provider, content_id, start_time, end_time, epg_id, country, drm_variant
                 )
-                if not manifest_url:
-                    response.status = 404
-                    return {
-                        "error": f'Catchup manifest not available for channel "{content_id}"'
-                    }
-                logger.debug(f"Redirecting to catchup manifest: {manifest_url}")
-                return redirect(manifest_url)
 
             if keyids:
                 # Deliberately NOT gated on manager.needs_proxy(provider) — that
@@ -669,6 +728,11 @@ def make_helpers(manager, service):
                 # URLs route through the proxy either way, only the "proxy" vs
                 # "decrypt" endpoint differs).
                 if service.media_proxy_url:
+                    logger.debug(
+                        f"CATCHUP PROXY-DECRYPT: {provider}/{content_id} "
+                        f"start={start_time} end={end_time} "
+                        f"receiver_side={receiver_side} highest_quality_only={highest_quality_only}"
+                    )
                     return service.get_decrypted_catchup_manifest(
                         provider, content_id,
                         start_time=start_time, end_time=end_time,
@@ -680,21 +744,9 @@ def make_helpers(manager, service):
                     # No proxy configured, but the client can decrypt on its
                     # own — best effort: redirect and hope the raw manifest
                     # carries adequate signaling.
-                    manifest_url = manager.get_catchup_manifest(
-                        provider_name=provider,
-                        channel_id=content_id,
-                        start_time=start_time,
-                        end_time=end_time,
-                        epg_id=epg_id,
-                        country=country,
-                        drm_variant=drm_variant,
+                    return _catchup_redirect(
+                        provider, content_id, start_time, end_time, epg_id, country, drm_variant
                     )
-                    if not manifest_url:
-                        response.status = 404
-                        return {
-                            "error": f'Catchup manifest not available for channel "{content_id}"'
-                        }
-                    return redirect(manifest_url)
                 else:
                     # Server was supposed to decrypt but has nothing to
                     # decrypt with.
@@ -703,25 +755,21 @@ def make_helpers(manager, service):
 
             elif is_unencrypted:
                 if manager.needs_proxy(provider):
+                    logger.debug(
+                        f"CATCHUP PROXY: {provider}/{content_id} "
+                        f"start={start_time} end={end_time} via proxied manifest"
+                    )
                     return service.get_proxied_catchup_manifest(
                         provider, content_id, start_time, end_time, epg_id, country
                     )
-                manifest_url = manager.get_catchup_manifest(
-                    provider_name=provider,
-                    channel_id=content_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    epg_id=epg_id,
-                    country=country,
-                    drm_variant=drm_variant,
+                served = _serve_adjusted_catchup(
+                    provider, content_id, start_time, end_time, epg_id, country, drm_variant
                 )
-                if not manifest_url:
-                    response.status = 404
-                    return {
-                        "error": f'Catchup manifest not available for channel "{content_id}"'
-                    }
-                logger.debug(f"Redirecting to catchup manifest: {manifest_url}")
-                return redirect(manifest_url)
+                if served is not None:
+                    return served
+                return _catchup_redirect(
+                    provider, content_id, start_time, end_time, epg_id, country, drm_variant
+                )
 
             else:
                 # Encrypted, not ClearKey (Widevine / PlayReady / other).
@@ -730,25 +778,21 @@ def make_helpers(manager, service):
                 # client negotiates the license via the x-kodi-drm-configs
                 # header. Both receiver_side values take the same path.
                 if manager.needs_proxy(provider):
+                    logger.debug(
+                        f"CATCHUP PROXY: {provider}/{content_id} "
+                        f"start={start_time} end={end_time} via proxied encrypted manifest"
+                    )
                     return service.get_proxied_catchup_manifest(
                         provider, content_id, start_time, end_time, epg_id, country
                     )
-                manifest_url = manager.get_catchup_manifest(
-                    provider_name=provider,
-                    channel_id=content_id,
-                    start_time=start_time,
-                    end_time=end_time,
-                    epg_id=epg_id,
-                    country=country,
-                    drm_variant=drm_variant,
+                served = _serve_adjusted_catchup(
+                    provider, content_id, start_time, end_time, epg_id, country, drm_variant
                 )
-                if not manifest_url:
-                    response.status = 404
-                    return {
-                        "error": f'Catchup manifest not available for channel "{content_id}"'
-                    }
-                logger.debug(f"Redirecting to catchup manifest: {manifest_url}")
-                return redirect(manifest_url)
+                if served is not None:
+                    return served
+                return _catchup_redirect(
+                    provider, content_id, start_time, end_time, epg_id, country, drm_variant
+                )
 
         # ==================================================================
         # Live / event / vod / recording path

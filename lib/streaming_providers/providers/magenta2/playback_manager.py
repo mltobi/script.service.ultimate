@@ -248,22 +248,17 @@ class PlaybackManager:
 
         Extracts an optional ``dvr_window_seconds`` override from kwargs;
         otherwise derives the window from ``end_time - start_time`` when both
-        are present, capped at ``DVR_WINDOW_SECONDS_DEFAULT``.
+        are present and clamps it to the provider's 4h ceiling.
         """
-        # Prefer an explicit override; otherwise derive from the requested
-        # time window so the DVR slider covers at least the requested range.
+        # Prefer an explicit override. Otherwise use the exact requested range,
+        # but never exceed the provider's maximum DVR window.
         if "dvr_window_seconds" in kwargs:
-            dvr_seconds: int = kwargs["dvr_window_seconds"]
+            dvr_seconds: int = int(kwargs["dvr_window_seconds"])
         else:
             start_time: int = kwargs["start_time"]
             end_time: int = kwargs["end_time"]
-            requested_window = end_time - start_time
-            # Never request a window smaller than the requested range, but
-            # cap at the provider default to avoid oversized requests.
-            dvr_seconds = max(
-                min(requested_window, DVR_WINDOW_SECONDS_DEFAULT),
-                DVR_WINDOW_SECONDS_DEFAULT,
-            )
+            requested_window = max(1, int(end_time - start_time))
+            dvr_seconds = min(requested_window, DVR_WINDOW_SECONDS_DEFAULT)
 
         logger.debug(
             f"get_manifest: catchup request for {content_id} "

@@ -8,12 +8,25 @@ from ...base.utils.logger import logger
 from ...base.utils.mpd_event_rewriter import get_mpd_event_rewriter
 
 _MAGENTA2_EPG_SCHEME = "urn:de:dtag:eit:2017"
+_ALT_MAGENTA2_EPG_SCHEME = "urn:dvb:iptv:2014:eit"
 _EVENT_MATCH_THRESHOLD_S = 300  # 5 minutes - still used as fallback
 _SKIP_NEAR_END_THRESHOLD_S = 300  # Skip event if less than 5 minutes remaining
 
 
 class Magenta2CatchupAdjuster:
     """Adjusts Magenta2 catchup manifests to requested start time."""
+
+    @staticmethod
+    def adjust_window(mpd_content: str, start_time: int, end_time: int) -> str:
+        """Serve the exact clicked EPG window [start_time, end_time] as a static VOD
+        MPD so playback starts at the programme start, independent of Magenta's
+        in-band EventStream boundaries."""
+        rewriter = get_mpd_event_rewriter()
+        try:
+            return rewriter.rewrite_static_window(mpd_content, int(start_time), int(end_time))
+        except Exception as exc:
+            logger.error(f"Magenta2: static-window rewrite failed: {exc}")
+            return mpd_content
 
     @staticmethod
     def adjust(mpd_content: str, requested_start_time: int) -> str:
@@ -36,9 +49,22 @@ class Magenta2CatchupAdjuster:
         requested_dt = datetime.fromtimestamp(requested_start_time, tz=timezone.utc)
 
         try:
-            extracted = rewriter.extract_events(mpd_content, _MAGENTA2_EPG_SCHEME)
+            extracted = None
+            chosen_scheme = None
+            for scheme in (_MAGENTA2_EPG_SCHEME, _ALT_MAGENTA2_EPG_SCHEME, None):
+                candidate = rewriter.extract_events(mpd_content, scheme)
+                if candidate.events:
+                    extracted = candidate
+                    chosen_scheme = scheme
+                    break
+            if extracted is None:
+                extracted = rewriter.extract_events(mpd_content)
             events = extracted.events
             ast = extracted.availability_start
+            if chosen_scheme is not None:
+                logger.debug(
+                    f"Magenta2: selected EPG scheme {chosen_scheme} for catchup alignment"
+                )
 
             if not events:
                 logger.warning("Magenta2: no events found, using buffer offset")
@@ -78,7 +104,7 @@ class Magenta2CatchupAdjuster:
                         return rewriter.rewrite_for_event(
                             mpd_content, extracted, best_event,
                             keep_other_events=False,
-                            force_static_if_ended=False,
+                            force_static_if_ended=True,
                         )
                     else:
                         # No next event, use buffer offset
@@ -93,7 +119,7 @@ class Magenta2CatchupAdjuster:
                     return rewriter.rewrite_for_event(
                         mpd_content, extracted, current_event,
                         keep_other_events=False,
-                        force_static_if_ended=False,
+                        force_static_if_ended=True,
                     )
 
             # Find the first event that starts AT OR AFTER requested time (upcoming show)
@@ -125,7 +151,7 @@ class Magenta2CatchupAdjuster:
                     return rewriter.rewrite_for_event(
                         mpd_content, extracted, best_event,
                         keep_other_events=False,
-                        force_static_if_ended=False,
+                        force_static_if_ended=True,
                     )
                 else:
                     logger.info(

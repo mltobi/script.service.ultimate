@@ -33,6 +33,7 @@ try:
         get_vfs_instance,
         is_kodi_environment,
     )
+    from streaming_providers.providers.magenta2.catchup_adjuster import Magenta2CatchupAdjuster
 except ImportError as import_err:
     print(
         f"Ultimate Backend: Critical import failed - {str(import_err)}", file=sys.stderr
@@ -342,6 +343,30 @@ class UltimateService:
         # Fallback to environment manager config
         return self.env_manager.get_config(setting_id, default)
 
+    @staticmethod
+    def _apply_magenta2_catchup_adjustment(provider: str, mpd_content: str, start_time: int,
+                                           end_time: int = None) -> str:
+        """Shift the MPD so playback begins at the actual programme start for Magenta2 catchup."""
+        if provider != "magenta2" or not mpd_content:
+            return mpd_content
+
+        try:
+            if end_time is not None:
+                adjusted = Magenta2CatchupAdjuster.adjust_window(
+                    mpd_content, int(start_time), int(end_time)
+                )
+            else:
+                adjusted = Magenta2CatchupAdjuster.adjust(mpd_content, int(start_time))
+            if adjusted != mpd_content:
+                logger.info(
+                    f"Magenta2 catchup adjuster applied for {provider} "
+                    f"start={start_time} end={end_time}"
+                )
+            return adjusted
+        except Exception as exc:
+            logger.warning(f"Magenta2 catchup MPD adjustment failed for {provider}: {exc}")
+            return mpd_content
+
     def fetch_manifest_for_rewriter(
             self,
             provider: str,
@@ -542,7 +567,8 @@ class UltimateService:
                 self.media_proxy_url, provider_proxy_url, None, False,
                 provider=provider, channel=channel_id, segment_headers=segment_headers,
             )
-            return rewriter.rewrite_mpd(manifest_text, effective_url), ttl
+            rewritten_mpd = rewriter.rewrite_mpd(manifest_text, effective_url)
+            return self._apply_magenta2_catchup_adjustment(provider, rewritten_mpd, start_time), ttl
 
         return self._fetch_and_cache_manifest(
             fetch_fn,
@@ -653,7 +679,8 @@ class UltimateService:
                 kid_resolver=self._make_kid_resolver(provider, segment_headers),
             )
             rewritten_mpd = rewriter.rewrite_mpd(manifest_text, effective_url)
-            return rewritten_mpd, min(ttl, 30)
+            adjusted = self._apply_magenta2_catchup_adjustment(provider, rewritten_mpd, start_time)
+            return adjusted, min(ttl, 30)
 
         return self._fetch_and_cache_manifest(
             fetch_fn,

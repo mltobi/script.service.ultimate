@@ -209,6 +209,15 @@ class MPDEventRewriter:
                 'mediaPresentationDuration',
                 self._seconds_to_duration(target_event.duration_seconds()),
             )
+            # Static VOD attributes only — these are invalid/meaningless for a
+            # non-live presentation and confuse players if left in.
+            for attr in ('minimumUpdatePeriod', 'timeShiftBufferDepth'):
+                root.attrib.pop(attr, None)
+            # Map presentation time 0 to the event start by offsetting each
+            # SegmentTemplate: this CDN's SegmentTimeline @t values are epoch-based
+            # media ticks, so a bare availabilityStartTime shift (which stays at the
+            # live edge in dynamic mode) is what made Kodi start at the 4h edge.
+            self._apply_static_window(root, target_event)
             logger.info(
                 f"Event {target_event.id} ended — converting to static MPD, "
                 f"duration={self._seconds_to_duration(target_event.duration_seconds())}"
@@ -269,6 +278,80 @@ class MPDEventRewriter:
             f"→ {requested_start.isoformat()} (offset={offset:.0f}s)"
         )
         return self._serialise(root)
+
+    def rewrite_static_window(
+        self,
+        mpd_content: str,
+        start_unix: int,
+        end_unix: int,
+    ) -> str:
+        """
+        Produce a static VOD MPD for the exact [start_unix, end_unix] wall-clock
+        window by trimming each SegmentTemplate's SegmentTimeline to that range and
+        setting presentationTimeOffset to the first retained segment, so the player
+        starts precisely at the requested programme start. This CDN's SegmentTimeline
+        @t are epoch-based media ticks (t/timescale == unix seconds).
+        """
+        root = ET.fromstring(mpd_content)
+        root.set('type', 'static')
+        root.set('mediaPresentationDuration',
+                 self._seconds_to_duration(max(0, end_unix - start_unix)))
+        root.set('suggestedPresentationDelay', 'PT0S')
+        for attr in ('minimumUpdatePeriod', 'timeShiftBufferDepth'):
+            root.attrib.pop(attr, None)
+
+        for st in root.findall('.//mpd:SegmentTemplate', self.NAMESPACES):
+            ts = int(st.get('timescale', '1'))
+            tl = st.find('mpd:SegmentTimeline', self.NAMESPACES)
+            if tl is None:
+                st.set('presentationTimeOffset', str(int(start_unix * ts)))
+                continue
+            first_t = self._trim_segment_timeline(tl, start_unix * ts, end_unix * ts)
+            st.set('presentationTimeOffset',
+                   str(first_t if first_t is not None else int(start_unix * ts)))
+
+        return self._serialise(root)
+
+    @staticmethod
+    def _trim_segment_timeline(tl: ET.Element, start_ticks: int, end_ticks: int) -> Optional[int]:
+        """Keep only <S> segments overlapping [start_ticks, end_ticks); rebuild the
+        timeline compactly. Returns the @t of the first retained segment, or None."""
+        ns = '{urn:mpeg:dash:schema:mpd:2011}'
+        kept: List[Tuple[int, int]] = []  # (t, d) per individual segment
+        cursor: Optional[int] = None
+        for s in tl.findall(f'{ns}S'):
+            d = int(s.get('d'))
+            t = int(s.get('t')) if s.get('t') is not None else (cursor if cursor is not None else 0)
+            r = int(s.get('r', '0'))
+            for _ in range(r + 1):
+                if t + d > start_ticks and t < end_ticks:
+                    kept.append((t, d))
+                t += d
+            cursor = t
+
+        for s in list(tl.findall(f'{ns}S')):
+            tl.remove(s)
+
+        if not kept:
+            return None
+
+        first_t = kept[0][0]
+        i = 0
+        while i < len(kept):
+            t, d = kept[i]
+            run = 0
+            j = i + 1
+            while j < len(kept) and kept[j][1] == d and kept[j][0] == kept[j - 1][0] + d:
+                run += 1
+                j += 1
+            elem = ET.SubElement(tl, f'{ns}S')
+            if i == 0 or t != kept[i - 1][0] + kept[i - 1][1]:
+                elem.set('t', str(t))
+            elem.set('d', str(d))
+            if run:
+                elem.set('r', str(run))
+            i = j
+        return first_t
 
     def get_event_timeline(
         self,
@@ -348,6 +431,14 @@ class MPDEventRewriter:
         })
         elem.text = ev.payload_base64
         es.append(elem)
+
+    def _apply_static_window(self, root: ET.Element, target_event: EventInfo) -> None:
+        """Set presentationTimeOffset on every SegmentTemplate so presentation 0 maps
+        to the event start (this CDN's SegmentTimeline @t are epoch-based ticks)."""
+        event_start_unix = target_event.presentation_time / target_event.timescale
+        for st in root.findall('.//mpd:SegmentTemplate', self.NAMESPACES):
+            ts = int(st.get('timescale', '1'))
+            st.set('presentationTimeOffset', str(int(round(event_start_unix * ts))))
 
     @staticmethod
     def _seconds_to_duration(seconds: float) -> str:
