@@ -1112,6 +1112,22 @@ class Magenta2Provider(StreamingProvider):
             content_id, start_time, end_time, drm_variant, **kwargs
         )
 
+    def get_catchup_drm(
+        self,
+        content_id: str,
+        start_time: int,
+        end_time: int,
+        epg_id: Optional[str] = None,
+        drm_variant: Optional[str] = None,
+        **kwargs: Any,
+    ) -> List[DRMConfig]:
+        # Magenta2 catchup is a DVR sliding window on the live stream, so the live
+        # Widevine licence applies unchanged. Without this override the base raises
+        # NotImplementedError and the pipeline finds no PSSH in the manifest, leaving
+        # encrypted channels (e.g. ProSiebenSat1) with an empty catchup DRM config
+        # that fails to license — public-broadcaster DVR is clear, so it only surfaced there.
+        return self.get_drm(content_id, drm_variant=drm_variant, content_type=CONTENT_TYPE_LIVE)
+
     def get_vod_category(
         self,
         content_id: str = "",
