@@ -7,6 +7,8 @@ stream resolution. This module only defines route decorators and the minimal
 channel-specific catchup handling logic.
 """
 
+import time
+
 from bottle import HTTPResponse, request, response
 from streaming_providers.base.utils import logger
 
@@ -69,6 +71,16 @@ def setup_channel_routes(app, manager, service, helpers):
                     )
                     response.status = 400
                     return {"error": "Invalid start_time or end_time format"}
+
+                # A programme whose start is still in the future isn't catchup content
+                # (not yet aired). This happens when Kodi auto-advances past the end of a
+                # running programme into the next EPG slot — fall through to live instead
+                # of a hard 404 so playback flows into live rather than erroring.
+                if start_time_int > int(time.time()):
+                    logger.debug(
+                        f"CATCHUP: start_time {start_time_int} is in the future — serving live"
+                    )
+                    is_catchup = False
 
                 # Window validation (catchup_hours lookup, age check) lives
                 # inside _resolve_stream_unified via _validate_catchup_window.

@@ -286,36 +286,54 @@ class MPDEventRewriter:
         end_unix: int,
     ) -> str:
         """
-        Produce a static VOD MPD for the exact [start_unix, end_unix] wall-clock
-        window by trimming each SegmentTemplate's SegmentTimeline to that range and
-        setting presentationTimeOffset to the first retained segment, so the player
-        starts precisely at the requested programme start. This CDN's SegmentTimeline
-        @t are epoch-based media ticks (t/timescale == unix seconds).
+        Build a static catchup VOD MPD for the [start_unix, end_unix] window.
+
+        end_unix is clamped to now, the SegmentTimeline is trimmed to the window,
+        presentationTimeOffset is set to the first retained segment (playback starts at
+        the programme start) and mediaPresentationDuration is derived from the segments
+        that actually exist. For a still-running programme this yields a correctly sized
+        seek bar covering only the already-aired part (no follow-to-live), which ISA
+        renders reliably — a dynamic window instead draws the full 4h DVR bar.
+
+        This CDN's SegmentTimeline @t are epoch-based media ticks (t/timescale == unix s).
         """
+        now = int(datetime.now(tz=timezone.utc).timestamp())
+        end_unix = min(end_unix, now)
+
         root = ET.fromstring(mpd_content)
         root.set('type', 'static')
-        root.set('mediaPresentationDuration',
-                 self._seconds_to_duration(max(0, end_unix - start_unix)))
         root.set('suggestedPresentationDelay', 'PT0S')
         for attr in ('minimumUpdatePeriod', 'timeShiftBufferDepth'):
             root.attrib.pop(attr, None)
 
+        available_spans_s: List[float] = []
         for st in root.findall('.//mpd:SegmentTemplate', self.NAMESPACES):
             ts = int(st.get('timescale', '1'))
             tl = st.find('mpd:SegmentTimeline', self.NAMESPACES)
             if tl is None:
                 st.set('presentationTimeOffset', str(int(start_unix * ts)))
                 continue
-            first_t = self._trim_segment_timeline(tl, start_unix * ts, end_unix * ts)
+            first_t, last_end = self._trim_segment_timeline(tl, start_unix * ts, end_unix * ts)
             st.set('presentationTimeOffset',
                    str(first_t if first_t is not None else int(start_unix * ts)))
+            if first_t is not None and last_end is not None:
+                available_spans_s.append((last_end - first_t) / ts)
+
+        # Clamp the presentation length to the shortest actually-available track so
+        # the player's seek bar ends at the last existing segment, not at end_unix.
+        duration_s = min(available_spans_s) if available_spans_s else max(0, end_unix - start_unix)
+        root.set('mediaPresentationDuration', self._seconds_to_duration(duration_s))
 
         return self._serialise(root)
 
+
+
     @staticmethod
-    def _trim_segment_timeline(tl: ET.Element, start_ticks: int, end_ticks: int) -> Optional[int]:
+    def _trim_segment_timeline(
+        tl: ET.Element, start_ticks: int, end_ticks: int
+    ) -> Tuple[Optional[int], Optional[int]]:
         """Keep only <S> segments overlapping [start_ticks, end_ticks); rebuild the
-        timeline compactly. Returns the @t of the first retained segment, or None."""
+        timeline compactly. Returns (first_t, last_segment_end) in ticks, or (None, None)."""
         ns = '{urn:mpeg:dash:schema:mpd:2011}'
         kept: List[Tuple[int, int]] = []  # (t, d) per individual segment
         cursor: Optional[int] = None
@@ -333,9 +351,10 @@ class MPDEventRewriter:
             tl.remove(s)
 
         if not kept:
-            return None
+            return None, None
 
         first_t = kept[0][0]
+        last_end = kept[-1][0] + kept[-1][1]
         i = 0
         while i < len(kept):
             t, d = kept[i]
@@ -351,7 +370,8 @@ class MPDEventRewriter:
             if run:
                 elem.set('r', str(run))
             i = j
-        return first_t
+        return first_t, last_end
+
 
     def get_event_timeline(
         self,
