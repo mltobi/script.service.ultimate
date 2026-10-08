@@ -28,6 +28,24 @@ class ProviderCatchupMixin:
         """
         return self.catchup_window > 0
 
+    @property
+    def rewrites_catchup_manifest(self) -> bool:
+        """
+        True if the backend must fetch this provider's catchup manifest, rewrite it
+        (e.g. to start playback at the programme start / bound a running programme) and
+        serve the body, instead of a plain redirect to the CDN. Default False (redirect).
+        """
+        return False
+
+    def rewrite_catchup_manifest(
+        self, mpd_content: str, start_time: int, end_time: int
+    ) -> str:
+        """
+        Rewrite a fetched catchup manifest body. Only invoked when
+        rewrites_catchup_manifest is True. Default returns it unchanged.
+        """
+        return mpd_content
+
     def get_catchup_manifest(
         self,
         content_id: str,

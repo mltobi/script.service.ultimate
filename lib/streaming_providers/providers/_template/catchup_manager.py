@@ -127,7 +127,31 @@ class YourCatchupManager(CatchupManager):
     #     **kw,
     # ) -> List[DRMConfig]:
     #     """
-    #     Override only if catchup uses a different DRM config from live.
-    #     The default returns [] -- the caller falls back to live DRM.
+    #     Override only if catchup needs DRM configs. The base implementation
+    #     raises NotImplementedError and the DRM pipeline then extracts PSSH from
+    #     the catchup manifest itself (it does NOT silently reuse live DRM).
+    #     If catchup uses exactly the same licence as live (e.g. a DVR sliding
+    #     window on the live stream), implement it explicitly as:
+    #         return self.get_drm(content_id, content_type=CONTENT_TYPE_LIVE)
+    #     Encrypted channels whose catchup manifest carries no PSSH/default_KID
+    #     REQUIRE this — otherwise licensing fails with an empty DRM config.
     #     """
-    #     return []
+    #     return self.get_drm(content_id, content_type=CONTENT_TYPE_LIVE)
+
+    # ----- Catchup manifest rewrite (optional) -----
+    #
+    # If the provider's catchup URL is the live DVR manifest and the backend must
+    # rewrite it (e.g. start playback at the programme start, bound a running
+    # programme) rather than redirect to the CDN, set this on the PROVIDER class
+    # (not the catchup manager) and implement rewrite_catchup_manifest:
+    #
+    #     @property
+    #     def rewrites_catchup_manifest(self) -> bool:
+    #         return True
+    #
+    #     def rewrite_catchup_manifest(self, mpd_content, start_time, end_time):
+    #         return YourCatchupAdjuster.adjust_window(mpd_content, start_time, end_time)
+    #
+    # The stream route then fetches, rewrites, injects an absolute BaseURL and
+    # serves the manifest body instead of a 302 redirect. Providers that don't set
+    # this (the default) keep the plain redirect behaviour.

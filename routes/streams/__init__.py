@@ -447,13 +447,15 @@ def make_helpers(manager, service):
     def _serve_adjusted_catchup(provider: str, content_id: str, start_time: int,
                                  end_time: int, epg_id, country, drm_variant: str):
         """
-        For providers whose catchup MPD needs a programme-start shift (Magenta2),
-        fetch the manifest, apply the adjuster, inject an absolute BaseURL and
-        serve the body — instead of redirecting to the raw CDN live+DVR manifest
-        (a 303 bypasses the adjuster, so playback would start at the live edge).
-        Returns None when no adjuster applies, signalling the caller to redirect.
+        For providers that rewrite their catchup manifest (rewrites_catchup_manifest),
+        fetch the manifest, let the provider rewrite it (start-at-programme / bound a
+        running programme), inject an absolute BaseURL and serve the body — instead of
+        redirecting to the raw CDN live+DVR manifest (a 303 bypasses the rewrite, so
+        playback would start at the live edge). Returns None when the provider does not
+        rewrite its catchup manifest, signalling the caller to redirect.
         """
-        if provider != "magenta2":
+        provider_instance = manager.get_provider(provider)
+        if not provider_instance or not getattr(provider_instance, "rewrites_catchup_manifest", False):
             return None
 
         manifest_url = manager.get_catchup_manifest(
@@ -469,8 +471,8 @@ def make_helpers(manager, service):
             manifest_text, _, _, _, effective_url = service.fetch_manifest_for_rewriter(
                 provider, content_id, manifest_url
             )
-            manifest_text = service._apply_magenta2_catchup_adjustment(
-                provider, manifest_text, start_time, end_time
+            manifest_text = provider_instance.rewrite_catchup_manifest(
+                manifest_text, start_time, end_time
             )
             # Inject an absolute MPD-level BaseURL (the CDN manifest directory) so the
             # manifest's own relative BaseURL/segment paths resolve to the CDN, not to

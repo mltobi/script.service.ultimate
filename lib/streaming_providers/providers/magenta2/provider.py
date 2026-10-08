@@ -38,6 +38,7 @@ from .auth import Magenta2Authenticator, Magenta2Credentials, Magenta2UserCreden
 from .channel_manager import ChannelManager
 from .epg_manager import Magenta2EpgManager
 from .playback_manager import PlaybackManager
+from .catchup_adjuster import Magenta2CatchupAdjuster
 from .config_models import ProviderConfig
 from .constants import (
     CONTENT_TYPE_LIVE,
@@ -1127,6 +1128,15 @@ class Magenta2Provider(StreamingProvider):
         # encrypted channels (e.g. ProSiebenSat1) with an empty catchup DRM config
         # that fails to license — public-broadcaster DVR is clear, so it only surfaced there.
         return self.get_drm(content_id, drm_variant=drm_variant, content_type=CONTENT_TYPE_LIVE)
+
+    @property
+    def rewrites_catchup_manifest(self) -> bool:
+        # Magenta2's catchup URL is the live DVR manifest; the backend must fetch it and
+        # rewrite it to start at the programme (see Magenta2CatchupAdjuster), not redirect.
+        return True
+
+    def rewrite_catchup_manifest(self, mpd_content: str, start_time: int, end_time: int) -> str:
+        return Magenta2CatchupAdjuster.adjust_window(mpd_content, int(start_time), int(end_time))
 
     def get_vod_category(
         self,
