@@ -499,7 +499,7 @@ class Magenta2EpgManager:
         logger.debug(f"[Magenta2EpgManager] Fetching schedule window {start_iso} ~ {end_iso} (UTC)")
 
         fields = (
-            "listings.stationId,"
+            "listings.guid,listings.stationId,"
             "listings.program.guid,listings.program.title,"
             "listings.startTime,listings.endTime"
         )

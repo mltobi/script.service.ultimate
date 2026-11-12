@@ -295,7 +295,10 @@ class PvrHttpMixin:
         Authenticated POST against the nPVR API.
 
         Returns:
-            Parsed JSON body on 200/201, or None on error.
+            Parsed JSON body on 200/201; an empty dict ``{}`` when the API
+            accepted the request without a body (202 Accepted / 204, which is
+            what schedule-recording-for-listing returns); None on error.
+            Callers must therefore test ``is None``, not truthiness.
         """
         headers = self._build_auth_headers()
         headers["Content-Type"] = PVR_ACCEPT_HEADER
@@ -303,8 +306,11 @@ class PvrHttpMixin:
 
         try:
             response = self._http.post(url, json=payload, headers=headers)
-            if response and response.status_code in (200, 201):
-                return response.json()
+            if response and response.status_code in (200, 201, 202, 204):
+                try:
+                    return response.json() if response.content else {}
+                except ValueError:
+                    return {}
             logger.warning(
                 f"{self._provider}: nPVR POST failed "
                 f"[{response.status_code if response else 'no response'}] {url}"
@@ -364,7 +370,7 @@ class PvrHttpMixin:
         if response.status_code == 404:
             raise KeyError(f"{self._provider}: Resource not found: {url}")
 
-        if response.status_code not in (200, 204):
+        if response.status_code not in (200, 202, 204):
             raise RuntimeError(
                 f"{self._provider}: DELETE failed [{response.status_code}] {url}: "
                 f"{response.text[:200]}"
