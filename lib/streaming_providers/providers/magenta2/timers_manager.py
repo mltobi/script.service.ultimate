@@ -63,6 +63,8 @@ at which point RecordingsManager takes ownership of the object.
 """
 
 import re
+import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -75,6 +77,8 @@ from .constants import (
     PVR_MAX_PAGE_LIMIT,
     PVR_GET_RECORDINGS_PATH,
     PVR_RECORDINGS_PATH,
+    PVR_DELETE_RECORDING_FOR_LISTING_PATH,
+    PVR_RECORDING_STATUSES_ACTIVE,
     PVR_TIMER_TYPE_EPG_ONE_SHOT,
     PVR_RECORDING_STATUSES_TIMERS,
 )
@@ -195,6 +199,15 @@ class TimersManager(PvrHttpMixin):
             if r
         ]
 
+        # The server-side byRecordingStatus filter does not reliably restrict the
+        # result to pending items (a finished RECORDED entry came back as well).
+        # A finished or cancelled entry is a recording / nothing, not a timer, so
+        # it must not stay in the timer list next to the recording itself.
+        timers = [
+            t for t in timers
+            if t.state not in (TimerState.COMPLETED, TimerState.CANCELLED)
+        ]
+
         logger.info(
             f"{self._provider}: Retrieved {len(timers)} timers "
             f"(offset={offset})"
@@ -235,13 +248,22 @@ class TimersManager(PvrHttpMixin):
         payload = self._build_create_payload(timer)
         data = self._post(url, payload)
 
-        if not data:
+        if data is None:
             raise RuntimeError(
                 f"{self._provider}: add_timer() — no response from nPVR API "
                 f"for listing '{timer.epg_event_id}'"
             )
 
-        created = self._map_timer(data)
+        if data:
+            created = self._map_timer(data)
+        else:
+            # 202 Accepted without a body: the recording is queued
+            # asynchronously and the API does not return the created object.
+            # Wait briefly until it shows up so the client's immediate reload
+            # of the timer list already contains it (with its real id).
+            created = self._wait_for_timer(timer.epg_event_id) or replace(
+                timer, state=TimerState.SCHEDULED
+            )
         logger.info(
             f"{self._provider}: Timer created — "
             f"client_index={created.client_index} title='{created.title}'"
@@ -317,13 +339,84 @@ class TimersManager(PvrHttpMixin):
             RuntimeError: If the API refuses deletion.
         """
         pvr_base_url = self._get_pvr_base_url()
-        url = f"{pvr_base_url}{PVR_RECORDINGS_PATH}/{client_index}"
 
+        listing_guid = self._resolve_timer_listing_guid(client_index)
+        if not listing_guid:
+            raise KeyError(
+                f"{self._provider}: no timer with client_index {client_index} found"
+            )
+
+        url = f"{pvr_base_url}{PVR_DELETE_RECORDING_FOR_LISTING_PATH}/{listing_guid}"
         status_code = self._delete(url)
         logger.info(
             f"{self._provider}: Timer '{client_index}' cancelled "
-            f"[HTTP {status_code}]"
+            f"(listing '{listing_guid}') [HTTP {status_code}]"
         )
+        # Cancelling is asynchronous (202). Wait until the timer is really gone
+        # so the client's immediate reload of the timer list is already correct.
+        self._wait_until_timer_gone(listing_guid)
+
+    def _resolve_timer_listing_guid(self, client_index: int) -> str:
+        """
+        Resolve the listing GUID of a timer from its client_index.
+
+        client_index is a hash of the nPVR recording id, so the raw recordings
+        are fetched and matched on that hash. The documented
+        ``DELETE /recordings/{id}`` path 404s; cancelling works through
+        ``delete-recording-for-listing/{listing.guid}``.
+        """
+        pvr_base_url = self._get_pvr_base_url()
+        data = self._get(
+            f"{pvr_base_url}{PVR_GET_RECORDINGS_PATH}",
+            {
+                "limit": PVR_MAX_PAGE_LIMIT,
+                "offset": 1,
+                "byRecordingStatus": "|".join(PVR_RECORDING_STATUSES_ACTIVE),
+            },
+        ) or {}
+        for raw in data.get("recordings", []):
+            if raw and _hex_id_to_int(raw.get("id", "")) == client_index:
+                listing = raw.get("listing") or {}
+                if isinstance(listing, dict):
+                    return listing.get("guid") or ""
+        return ""
+
+    def _wait_until_timer_gone(
+        self, listing_guid: str, attempts: int = 6, delay: float = 1.0
+    ) -> bool:
+        """Poll the timer list until no timer for ``listing_guid`` remains."""
+        for attempt in range(attempts):
+            try:
+                if not any(t.epg_event_id == listing_guid for t in self.get_timers()):
+                    return True
+            except Exception as exc:  # polling is best effort
+                logger.debug(f"{self._provider}: timer poll failed: {exc}")
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        logger.info(
+            f"{self._provider}: timer for '{listing_guid}' still listed after "
+            f"{attempts} polls"
+        )
+        return False
+
+    def _wait_for_timer(
+        self, listing_guid: str, attempts: int = 6, delay: float = 1.0
+    ) -> Optional[Timer]:
+        """Poll the timer list until the timer for ``listing_guid`` appears."""
+        for attempt in range(attempts):
+            try:
+                for t in self.get_timers():
+                    if t.epg_event_id == listing_guid:
+                        return t
+            except Exception as exc:  # polling is best effort
+                logger.debug(f"{self._provider}: timer poll failed: {exc}")
+            if attempt < attempts - 1:
+                time.sleep(delay)
+        logger.info(
+            f"{self._provider}: timer for '{listing_guid}' not visible yet after "
+            f"{attempts} polls; returning the requested timer"
+        )
+        return None
 
     # =========================================================================
     # Private helpers – request building
@@ -361,11 +454,13 @@ class TimersManager(PvrHttpMixin):
             ],
         }
 
-        # Pre/post padding — convert from minutes (Timer model) to seconds (API)
-        if timer.margin_start:
-            payload["startOffsetSeconds"] = timer.margin_start * 60
-        if timer.margin_end:
-            payload["endOffsetSeconds"] = timer.margin_end * 60
+        # Pre/post padding — convert from minutes (Timer model) to seconds (API).
+        # Always sent, including 0: leaving them out lets the provider apply its
+        # own default padding (a recording of a 35 min broadcast came out at
+        # 39:29). Whether the API honours an explicit 0 is verified by measuring
+        # the resulting recording.
+        payload["startOffsetSeconds"] = max(0, timer.margin_start or 0) * 60
+        payload["endOffsetSeconds"] = max(0, timer.margin_end or 0) * 60
 
         return payload
 

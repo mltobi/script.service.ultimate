@@ -129,11 +129,24 @@ class RecordingsManager(PvrHttpMixin):
             return []
 
         raw_recordings = data.get("recordings", [])
+        logger.debug(
+            f"{self._provider}: raw recording statuses: "
+            + ", ".join(
+                f"{(r or {}).get('program', {}).get('title', '?')}={(r or {}).get('recordingStatus')}"
+                for r in raw_recordings
+            )
+        )
         recordings = [
             self._map_recording(r)
             for r in raw_recordings
             if r  # skip any null/empty entries
         ]
+
+        # Entries that are only scheduled (PENDING) are timers, not recordings:
+        # they belong to the timer list. Filter on the mapped status after the
+        # request, since the server-side byRecordingStatus filter is not a
+        # reliable way to express this.
+        recordings = [r for r in recordings if r.status != RecordingStatus.PENDING]
 
         logger.info(
             f"{self._provider}: Retrieved {len(recordings)} recordings "
